@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESP32Servo.h>
+//tomi rulez
 
 // --- Configuración de Red WiFi ---
 const char* ssid     = "elquesabesabe";       
@@ -48,7 +49,9 @@ volatile bool stopRequested = false;
 
 String currentMovement = "stop"; 
 bool motorsEnabled = false;
-int motorSpeed = 150; // Rango 0 - 255
+int motorSpeed = 150;        // Velocidad continua (Rango 0 - 255)
+int kickstartPWM = 200;      // Fuerza del pulso de arranque (Rango 0 - 255)
+int kickstartDuration = 75;  // Duración del pulso en milisegundos (Rango 0 - 500)
 
 const int NUM_POINTS = 13;
 int sequence[NUM_POINTS][2] = {
@@ -61,15 +64,15 @@ WebServer server(80);
 
 // --- Función de Control de Tracción L298N ---
 void updateMotorAction(String cmd) {
+  static String lastCmd = "stop";
+
   if (!motorsEnabled || cmd == "stop") {
     digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, LOW);
     digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
     ledcWrite(PIN_ENA, 0);      ledcWrite(PIN_ENB, 0);
+    lastCmd = "stop";
     return;
   }
-
-  ledcWrite(PIN_ENA, motorSpeed);
-  ledcWrite(PIN_ENB, motorSpeed);
 
   if (cmd == "forward") {
     digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
@@ -84,6 +87,19 @@ void updateMotorAction(String cmd) {
     digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);  
     digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH); 
   }
+
+  // Lógica de "Kickstart" (Fuerza y tiempo desde los sliders web)
+  if (cmd != lastCmd && kickstartDuration > 0) {
+    ledcWrite(PIN_ENA, kickstartPWM);
+    ledcWrite(PIN_ENB, kickstartPWM);
+    delay(kickstartDuration); 
+  }
+
+  // Velocidad continua normal
+  ledcWrite(PIN_ENA, motorSpeed);
+  ledcWrite(PIN_ENB, motorSpeed);
+
+  lastCmd = cmd;
 }
 
 // --- Interrupciones ---
@@ -196,7 +212,7 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
         .toggle-group { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; background: #fdfefe; padding: 10px; border: 1px solid #ccc; border-radius: 8px;}
         .toggle-group input { width: 20px; height: 20px; cursor: pointer; }
 
-        /* Estilos del D-Pad (Cruzeta de direcciones) */
+        /* Estilos del D-Pad */
         .d-pad { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 20px; }
         .btn-dir { background-color: #3498db; color: white; border: none; padding: 15px 5px; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 14px;}
         .btn-dir:hover { background-color: #2980b9; }
@@ -221,8 +237,18 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
         </div>
         
         <div class="control-group">
-            <label>Velocidad de Motores (PWM) <span id="valSpeed" class="value-display">150</span></label>
+            <label>Velocidad Continua (PWM) <span id="valSpeed" class="value-display">150</span></label>
             <input type="range" min="0" max="255" value="150" class="slider" id="motorSpeed" oninput="updateMotorConfig()">
+        </div>
+        
+        <div class="control-group">
+            <label>Fuerza de Arranque (Kickstart) <span id="valKick" class="value-display">200</span></label>
+            <input type="range" min="0" max="255" value="200" class="slider" id="kickstartPWM" oninput="updateMotorConfig()">
+        </div>
+
+        <div class="control-group">
+            <label>Duración de Arranque (ms) <span id="valKickDur" class="value-display">75</span></label>
+            <input type="range" min="0" max="500" value="75" class="slider" id="kickstartDur" oninput="updateMotorConfig()">
         </div>
 
         <label>Control de Pruebas Manuales:</label>
@@ -278,14 +304,19 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
         function updateMotorConfig() {
             let isEnabled = document.getElementById('motorEnabled').checked ? 1 : 0;
             let currentSpeed = document.getElementById('motorSpeed').value;
+            let currentKick = document.getElementById('kickstartPWM').value;
+            let currentKickDur = document.getElementById('kickstartDur').value;
+            
             document.getElementById('valSpeed').innerText = currentSpeed;
-            fetch('/motorConfig?enabled=' + isEnabled + '&speed=' + currentSpeed);
+            document.getElementById('valKick').innerText = currentKick;
+            document.getElementById('valKickDur').innerText = currentKickDur;
+            
+            fetch('/motorConfig?enabled=' + isEnabled + '&speed=' + currentSpeed + '&kickPWM=' + currentKick + '&kickDur=' + currentKickDur);
         }
 
         function runSequence() { fetch('/sequence'); }
         function runReverse() { fetch('/reverse'); }
         
-        // Nueva función unificada para comandos de movimiento y paro
         function sendCommand(cmd) {
             fetch('/move', {
                 method: 'POST',
@@ -302,7 +333,11 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
                 document.getElementById('servoD').value = data.D; document.getElementById('valD').innerText = data.D;
                 
                 document.getElementById('movStatus').innerText = data.mov; 
+                
                 document.getElementById('motorSpeed').value = data.speed; document.getElementById('valSpeed').innerText = data.speed;
+                document.getElementById('kickstartPWM').value = data.kickPWM; document.getElementById('valKick').innerText = data.kickPWM;
+                document.getElementById('kickstartDur').value = data.kickDur; document.getElementById('valKickDur').innerText = data.kickDur;
+                
                 document.getElementById('motorEnabled').checked = data.enabled;
             });
         }, 500); 
@@ -318,14 +353,18 @@ void handleRoot() {
 
 void handleStatus() {
   String json = "{\"A\":" + String(posA) + ",\"B\":" + String(posB) + ",\"C\":" + String(posC) + ",\"D\":" + String(posD) + 
-                ",\"mov\":\"" + currentMovement + "\",\"speed\":" + String(motorSpeed) + ",\"enabled\":" + (motorsEnabled ? "true" : "false") + "}";
+                ",\"mov\":\"" + currentMovement + "\",\"speed\":" + String(motorSpeed) + ",\"enabled\":" + (motorsEnabled ? "true" : "false") + 
+                ",\"kickPWM\":" + String(kickstartPWM) + ",\"kickDur\":" + String(kickstartDuration) + "}";
   server.send(200, "application/json", json);
 }
 
 void handleMotorConfig() {
-  if (server.hasArg("enabled") && server.hasArg("speed")) {
+  // Ahora requiere también el parámetro kickDur
+  if (server.hasArg("enabled") && server.hasArg("speed") && server.hasArg("kickPWM") && server.hasArg("kickDur")) {
     motorsEnabled = server.arg("enabled") == "1";
     motorSpeed = constrain(server.arg("speed").toInt(), 0, 255);
+    kickstartPWM = constrain(server.arg("kickPWM").toInt(), 0, 255);
+    kickstartDuration = constrain(server.arg("kickDur").toInt(), 0, 500); // Límite de seguridad 500ms
     
     if (!motorsEnabled) updateMotorAction("stop");
     else updateMotorAction(currentMovement); 
@@ -403,7 +442,6 @@ void handleMoveRequest() {
 void setup() {
   Serial.begin(115200);
 
-  // Inicializa Pines L298N (Direcciones)
   pinMode(PIN_IN1, OUTPUT); pinMode(PIN_IN2, OUTPUT);
   pinMode(PIN_IN3, OUTPUT); pinMode(PIN_IN4, OUTPUT);
   
