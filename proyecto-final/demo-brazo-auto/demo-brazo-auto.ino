@@ -32,7 +32,7 @@ Servo servoC;
 Servo servoD;  
 
 // Variables globales del Brazo
-volatile int posA = 90;
+volatile int posA = 81;
 volatile int posB = 90; 
 volatile int posC = 90; 
 volatile int posD = 90;
@@ -49,9 +49,12 @@ volatile bool stopRequested = false;
 
 String currentMovement = "stop"; 
 bool motorsEnabled = false;
-int motorSpeed = 150;        // Velocidad continua (Rango 0 - 255)
-int kickstartPWM = 200;      // Fuerza del pulso de arranque (Rango 0 - 255)
-int kickstartDuration = 75;  // Duración del pulso en milisegundos (Rango 0 - 500)
+int motorSpeed = 100;        // Velocidad continua (Rango 0 - 255)
+int turnSpeed = 100;         // Velocidad al girar (Rango 0 - 255)
+int forwardKickPWM = 200;    // Fuerza arranque adelante (150-255)
+int forwardKickDur  = 15;    // Duración arranque adelante ms (0-100)
+int turnKickPWM     = 200;   // Fuerza arranque giro (150-255)
+int turnKickDur     = 15;    // Duración arranque giro ms (0-100)
 
 const int NUM_POINTS = 13;
 int sequence[NUM_POINTS][2] = {
@@ -81,23 +84,27 @@ void updateMotorAction(String cmd) {
     digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, HIGH);
     digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH);
   } else if (cmd == "left") {
-    digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, HIGH); 
-    digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);  
+    digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, LOW);   // A stop
+    digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);   // B forward
   } else if (cmd == "right") {
-    digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);  
-    digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH); 
+    digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, LOW);   // A stop
+    digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH);  // B reverse
   }
 
-  // Lógica de "Kickstart" (Fuerza y tiempo desde los sliders web)
-  if (cmd != lastCmd && kickstartDuration > 0) {
-    ledcWrite(PIN_ENA, kickstartPWM);
-    ledcWrite(PIN_ENB, kickstartPWM);
-    delay(kickstartDuration); 
+  // Kickstart con parámetros separados por modo
+  bool isTurn = (cmd == "left" || cmd == "right");
+  bool needsKick = (cmd != lastCmd && !isTurn && forwardKickDur > 0) || (cmd != lastCmd && isTurn && turnKickDur > 0);
+  if (needsKick) {
+    int pwm = isTurn ? turnKickPWM : forwardKickPWM;
+    int dur = isTurn ? turnKickDur : forwardKickDur;
+    ledcWrite(PIN_ENA, isTurn ? 0 : pwm);
+    ledcWrite(PIN_ENB, pwm);
+    delay(dur);
   }
 
-  // Velocidad continua normal
-  ledcWrite(PIN_ENA, motorSpeed);
-  ledcWrite(PIN_ENB, motorSpeed);
+  // PWM continuo: turn usa turnSpeed en B, forward/backward usa motorSpeed en ambos
+  ledcWrite(PIN_ENA, isTurn ? 0 : motorSpeed);
+  ledcWrite(PIN_ENB, isTurn ? turnSpeed : motorSpeed);
 
   lastCmd = cmd;
 }
@@ -242,13 +249,25 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
         </div>
         
         <div class="control-group">
-            <label>Fuerza de Arranque (Kickstart) <span id="valKick" class="value-display">200</span></label>
-            <input type="range" min="0" max="255" value="200" class="slider" id="kickstartPWM" oninput="updateMotorConfig()">
+            <label>Velocidad de Giro (Turn PWM) <span id="valTurn" class="value-display">100</span></label>
+            <input type="range" min="0" max="255" value="100" class="slider" id="turnSpeed" oninput="updateMotorConfig()">
         </div>
 
         <div class="control-group">
-            <label>Duración de Arranque (ms) <span id="valKickDur" class="value-display">75</span></label>
-            <input type="range" min="0" max="500" value="75" class="slider" id="kickstartDur" oninput="updateMotorConfig()">
+            <label>Fuerza Arranque Adelante <span id="valFwdKick" class="value-display">200</span></label>
+            <input type="range" min="150" max="255" value="200" class="slider" id="forwardKickPWM" oninput="updateMotorConfig()">
+        </div>
+        <div class="control-group">
+            <label>Duración Arranque Adelante (ms) <span id="valFwdDur" class="value-display">15</span></label>
+            <input type="range" min="0" max="100" value="15" class="slider" id="forwardKickDur" oninput="updateMotorConfig()">
+        </div>
+        <div class="control-group">
+            <label>Fuerza Arranque Giro <span id="valTurnKick" class="value-display">200</span></label>
+            <input type="range" min="150" max="255" value="200" class="slider" id="turnKickPWM" oninput="updateMotorConfig()">
+        </div>
+        <div class="control-group">
+            <label>Duración Arranque Giro (ms) <span id="valTurnDur" class="value-display">15</span></label>
+            <input type="range" min="0" max="100" value="15" class="slider" id="turnKickDur" oninput="updateMotorConfig()">
         </div>
 
         <label>Control de Pruebas Manuales:</label>
@@ -304,14 +323,21 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
         function updateMotorConfig() {
             let isEnabled = document.getElementById('motorEnabled').checked ? 1 : 0;
             let currentSpeed = document.getElementById('motorSpeed').value;
-            let currentKick = document.getElementById('kickstartPWM').value;
-            let currentKickDur = document.getElementById('kickstartDur').value;
+            let currentTurn = document.getElementById('turnSpeed').value;
+            let curFwdPWM = document.getElementById('forwardKickPWM').value;
+            let curFwdDur = document.getElementById('forwardKickDur').value;
+            let curTurnPWM = document.getElementById('turnKickPWM').value;
+            let curTurnDur = document.getElementById('turnKickDur').value;
             
             document.getElementById('valSpeed').innerText = currentSpeed;
-            document.getElementById('valKick').innerText = currentKick;
-            document.getElementById('valKickDur').innerText = currentKickDur;
+            document.getElementById('valTurn').innerText = currentTurn;
+            document.getElementById('valFwdKick').innerText = curFwdPWM;
+            document.getElementById('valFwdDur').innerText = curFwdDur;
+            document.getElementById('valTurnKick').innerText = curTurnPWM;
+            document.getElementById('valTurnDur').innerText = curTurnDur;
             
-            fetch('/motorConfig?enabled=' + isEnabled + '&speed=' + currentSpeed + '&kickPWM=' + currentKick + '&kickDur=' + currentKickDur);
+            fetch('/motorConfig?enabled=' + isEnabled + '&speed=' + currentSpeed + '&turnPWM=' + currentTurn
+                + '&fwdPWM=' + curFwdPWM + '&fwdDur=' + curFwdDur + '&turnKickPWM=' + curTurnPWM + '&turnKickDur=' + curTurnDur);
         }
 
         function runSequence() { fetch('/sequence'); }
@@ -335,8 +361,11 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
                 document.getElementById('movStatus').innerText = data.mov; 
                 
                 document.getElementById('motorSpeed').value = data.speed; document.getElementById('valSpeed').innerText = data.speed;
-                document.getElementById('kickstartPWM').value = data.kickPWM; document.getElementById('valKick').innerText = data.kickPWM;
-                document.getElementById('kickstartDur').value = data.kickDur; document.getElementById('valKickDur').innerText = data.kickDur;
+                document.getElementById('turnSpeed').value = data.turn; document.getElementById('valTurn').innerText = data.turn;
+                document.getElementById('forwardKickPWM').value = data.fwdPWM; document.getElementById('valFwdKick').innerText = data.fwdPWM;
+                document.getElementById('forwardKickDur').value = data.fwdDur; document.getElementById('valFwdDur').innerText = data.fwdDur;
+                document.getElementById('turnKickPWM').value = data.turnKickPWM; document.getElementById('valTurnKick').innerText = data.turnKickPWM;
+                document.getElementById('turnKickDur').value = data.turnKickDur; document.getElementById('valTurnDur').innerText = data.turnKickDur;
                 
                 document.getElementById('motorEnabled').checked = data.enabled;
             });
@@ -354,17 +383,23 @@ void handleRoot() {
 void handleStatus() {
   String json = "{\"A\":" + String(posA) + ",\"B\":" + String(posB) + ",\"C\":" + String(posC) + ",\"D\":" + String(posD) + 
                 ",\"mov\":\"" + currentMovement + "\",\"speed\":" + String(motorSpeed) + ",\"enabled\":" + (motorsEnabled ? "true" : "false") + 
-                ",\"kickPWM\":" + String(kickstartPWM) + ",\"kickDur\":" + String(kickstartDuration) + "}";
+                ",\"turn\":" + String(turnSpeed) + 
+                ",\"fwdPWM\":" + String(forwardKickPWM) + ",\"fwdDur\":" + String(forwardKickDur) + 
+                ",\"turnKickPWM\":" + String(turnKickPWM) + ",\"turnKickDur\":" + String(turnKickDur) + "}";
   server.send(200, "application/json", json);
 }
 
 void handleMotorConfig() {
   // Ahora requiere también el parámetro kickDur
-  if (server.hasArg("enabled") && server.hasArg("speed") && server.hasArg("kickPWM") && server.hasArg("kickDur")) {
+  if (server.hasArg("enabled") && server.hasArg("speed") && server.hasArg("turnPWM")
+      && server.hasArg("fwdPWM") && server.hasArg("fwdDur") && server.hasArg("turnKickPWM") && server.hasArg("turnKickDur")) {
     motorsEnabled = server.arg("enabled") == "1";
     motorSpeed = constrain(server.arg("speed").toInt(), 0, 255);
-    kickstartPWM = constrain(server.arg("kickPWM").toInt(), 0, 255);
-    kickstartDuration = constrain(server.arg("kickDur").toInt(), 0, 500); // Límite de seguridad 500ms
+    turnSpeed = constrain(server.arg("turnPWM").toInt(), 0, 255);
+    forwardKickPWM = constrain(server.arg("fwdPWM").toInt(), 150, 255);
+    forwardKickDur = constrain(server.arg("fwdDur").toInt(), 0, 100);
+    turnKickPWM = constrain(server.arg("turnKickPWM").toInt(), 150, 255);
+    turnKickDur = constrain(server.arg("turnKickDur").toInt(), 0, 100);
     
     if (!motorsEnabled) updateMotorAction("stop");
     else updateMotorAction(currentMovement); 
