@@ -56,11 +56,11 @@ int forwardKickDur  = 15;    // Duración arranque adelante ms (0-100)
 int turnKickPWM     = 200;   // Fuerza arranque giro (150-255)
 int turnKickDur     = 15;    // Duración arranque giro ms (0-100)
 
-const int NUM_POINTS = 13;
+const int NUM_POINTS = 3;
 int sequence[NUM_POINTS][2] = {
-  {180, 0}, {140, 0}, {140, 10}, {130, 10}, {130, 20},
-  {120, 20}, {120, 35}, {110, 35}, {100, 55}, {100, 65},
-  {85, 65}, {85, 50}, {65, 80}
+  {180, 30},   // Punto 1: B=180, C=30
+  {150, 0},    // Punto 2: B=150, C=0
+  {76, 100}    // Punto 3: B=76,  C=100
 };
 
 WebServer server(80);
@@ -135,53 +135,50 @@ void smartDelay(unsigned long ms) {
   unsigned long start = millis();
   while (millis() - start < ms) {
     server.handleClient();
-    if (stopRequested) return; 
     delay(10);
   }
 }
 
-// --- Funciones de Interpolación ---
-void moveToPoint(int index) {
-  int targetB = constrain(sequence[index][0], 65, 180);
-  int targetC = constrain(sequence[index][1], 0, 100);
+// --- Funciones de Movimiento ---
+void moveBetweenPoints(int fromIdx, int toIdx) {
+  int targetB = constrain(sequence[toIdx][0], 65, 180);
+  int targetC = constrain(sequence[toIdx][1], 0, 100);
 
-  int startB = posB;
-  int startC = posC;
+  //if (stopRequested) return;
 
-  int diffB = targetB - startB;
-  int diffC = targetC - startC;
-
-  int steps = max(abs(diffB), abs(diffC));
-
-  if (steps > 0) {
-    for (int s = 1; s <= steps; s++) {
-      if (stopRequested) return;
-      posB = startB + (diffB * s) / steps;
-      posC = startC + (diffC * s) / steps;
-      servoB.write(posB);
-      servoC.write(posC);
-      server.handleClient(); 
-      delay(15);             
-    }
+  if (toIdx == 1) {
+    // Destino es punto 2: C se mueve primero
+    posB = targetB;
+    servoB.write(posB);
+    smartDelay(1000);
+    //if (stopRequested) return;
+    posC = targetC;
+    servoC.write(posC);
+  } else {
+    // Destino es punto 1 o 3: B se mueve primero
+    posC = targetC;
+    servoC.write(posC);
+    smartDelay(1000);
+    //if (stopRequested) return;
+    posB = targetB;
+    servoB.write(posB);
   }
+  smartDelay(1000);
+  //if (stopRequested) return;
 }
 
 void playSequence() {
   stopRequested = false;
-  for (int i = 0; i < NUM_POINTS; i++) {
-    if (stopRequested) break;
-    moveToPoint(i);
-    smartDelay(200); 
-  }
+  moveBetweenPoints(0, 1);  // 1 -> 2
+  //if (stopRequested) return;
+  moveBetweenPoints(1, 2);  // 2 -> 3
 }
 
 void playReverseSequence() {
   stopRequested = false;
-  for (int i = NUM_POINTS - 1; i >= 0; i--) {
-    if (stopRequested) break;
-    moveToPoint(i);
-    smartDelay(200); 
-  }
+  moveBetweenPoints(2, 1);  // 3 -> 2
+  //if (stopRequested) return;
+  moveBetweenPoints(1, 0);  // 2 -> 1
 }
 
 // --- Interfaz Web dinámica ---
@@ -310,6 +307,11 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
             <button class="btn btn-rev" onclick="runReverse()">Secuencia Inversa</button>
             <button class="btn btn-seq" onclick="runSequence()">Secuencia Adelante</button>
         </div>
+
+        <div class="button-group">
+            <button class="btn btn-rev" onclick="closeGripper()">Cerrar Pinza</button>
+            <button class="btn btn-seq" onclick="openGripper()">Abrir Pinza</button>
+        </div>
         
         <button class="btn btn-stop" onclick="sendCommand('stop')">PARADA DE EMERGENCIA GLOBAL</button>
     </div>
@@ -342,6 +344,8 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
 
         function runSequence() { fetch('/sequence'); }
         function runReverse() { fetch('/reverse'); }
+        function openGripper() { fetch('/gripper/open'); }
+        function closeGripper() { fetch('/gripper/close'); }
         
         function sendCommand(cmd) {
             fetch('/move', {
@@ -438,6 +442,20 @@ void handleReverseRequest() {
   triggerReverse = true; 
 }
 
+void handleOpenGripper() {
+  stopRequested = true;
+  posD = 90;
+  servoD.write(posD);
+  server.send(200, "text/plain", "Pinza abierta");
+}
+
+void handleCloseGripper() {
+  stopRequested = true;
+  posD = 20;
+  servoD.write(posD);
+  server.send(200, "text/plain", "Pinza cerrada");
+}
+
 void handleMoveRequest() {
   if (server.hasArg("plain")) { 
     String body = server.arg("plain");
@@ -521,6 +539,8 @@ void setup() {
   server.on("/motorConfig", HTTP_GET, handleMotorConfig); 
   server.on("/sequence", HTTP_GET, handleSequenceRequest);
   server.on("/reverse", HTTP_GET, handleReverseRequest); 
+  server.on("/gripper/open", HTTP_GET, handleOpenGripper);
+  server.on("/gripper/close", HTTP_GET, handleCloseGripper);
   server.on("/move", HTTP_POST, handleMoveRequest); 
   server.on("/move/", HTTP_POST, handleMoveRequest); 
   
@@ -540,13 +560,11 @@ void loop() {
   }
 
   if (cambioHombro) {
-    stopRequested = true; 
     servoB.write(posB);
     cambioHombro = false;
   }
 
   if (cambioCodo) {
-    stopRequested = true;
     servoC.write(posC);
     cambioCodo = false;
   }
