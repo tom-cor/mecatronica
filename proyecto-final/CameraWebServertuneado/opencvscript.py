@@ -10,11 +10,25 @@ def nothing(x):
     """Dummy callback function for trackbars."""
     pass
 
-def send_movement(ip, direction):
+def send_movement(ip, direction, ticks=None):
     """Sends the movement command to the robot endpoint in a background thread."""
     url = f"http://{ip}/move"
     try:
-        requests.post(url, json={"command": direction}, timeout=1.0)
+        data = {"command": direction}
+        if ticks is not None:
+            data["ticks"] = ticks
+        requests.post(url, json=data, timeout=1.0)
+    except requests.exceptions.RequestException:
+        pass
+
+def execute_arm_sequence(ip):
+    """Executes reverse → close gripper → forward sequence after robot stops."""
+    try:
+        requests.get(f"http://{ip}/reverse", timeout=10)
+        time.sleep(1)
+        requests.get(f"http://{ip}/gripper/close", timeout=5)
+        time.sleep(1)
+        requests.get(f"http://{ip}/sequence", timeout=10)
     except requests.exceptions.RequestException:
         pass
 
@@ -37,7 +51,8 @@ def main():
     
     cv2.createTrackbar("Target X", "Video Stream Tracking", 320, 640, nothing)
     cv2.createTrackbar("Center Thresh", "Video Stream Tracking", 30, 160, nothing)
-    cv2.createTrackbar("Nudge (ms)", "Video Stream Tracking", 150, 500, nothing)
+    cv2.createTrackbar("Fine Thresh", "Video Stream Tracking", 15, 160, nothing)
+    cv2.createTrackbar("Nudge Ticks", "Video Stream Tracking", 5, 50, nothing)
     cv2.createTrackbar("Stop Area", "Video Stream Tracking", 15500, 30000, nothing)
     cv2.createTrackbar("Fine Area", "Video Stream Tracking", 10000, 30000, nothing)
     cv2.createTrackbar("Over Area", "Video Stream Tracking", 17000, 30000, nothing)
@@ -58,8 +73,9 @@ def main():
     cooldown = 0.5 
     nudge_state = "IDLE"
     nudge_start = 0
-    nudge_eff_dur = 0
+    nudge_eff_ticks = 0
     abs_dx = 0
+    arm_sequence_triggered = False
 
     while True:
         ret, frame = cap.read()
@@ -72,6 +88,7 @@ def main():
 
         target_x = cv2.getTrackbarPos("Target X", "Video Stream Tracking")
         center_thresh = cv2.getTrackbarPos("Center Thresh", "Video Stream Tracking")
+        fine_thresh = cv2.getTrackbarPos("Fine Thresh", "Video Stream Tracking")
         stop_area = cv2.getTrackbarPos("Stop Area", "Video Stream Tracking")
         fine_tune_area = cv2.getTrackbarPos("Fine Area", "Video Stream Tracking")
         overshoot_area = cv2.getTrackbarPos("Over Area", "Video Stream Tracking")
@@ -79,6 +96,8 @@ def main():
         cv2.line(frame, (target_x, 0), (target_x, frame_height), (255, 255, 255), 1)
         cv2.line(frame, (target_x - center_thresh, 0), (target_x - center_thresh, frame_height), (100, 100, 100), 1)
         cv2.line(frame, (target_x + center_thresh, 0), (target_x + center_thresh, frame_height), (100, 100, 100), 1)
+        cv2.line(frame, (target_x - fine_thresh, 0), (target_x - fine_thresh, frame_height), (50, 200, 50), 1)
+        cv2.line(frame, (target_x + fine_thresh, 0), (target_x + fine_thresh, frame_height), (50, 200, 50), 1)
 
         blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
         yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
@@ -122,13 +141,13 @@ def main():
                     state = "BACKING"
                     robot_cmd = "backward"
                 elif obj_area >= stop_area:
-                    if abs_dx <= center_thresh:
+                    if abs_dx <= fine_thresh:
                         state = "STOPPED"
                         robot_cmd = "stop"
                     else:
                         state = "CENTERING"
                         robot_cmd = "right" if dx > 0 else "left"
-                elif abs_dx > center_thresh:
+                elif abs_dx > (fine_thresh if obj_area >= fine_tune_area else center_thresh):
                     state = "CENTERING"
                     robot_cmd = "right" if dx > 0 else "left"
                 elif obj_area >= fine_tune_area:
@@ -142,36 +161,44 @@ def main():
         if robot_cmd is None:
             robot_cmd = "stop"
 
-        # Nudge state machine
+        # Compute effective ticks for the next nudge
         current_time = time.time()
-        nudge_dur = cv2.getTrackbarPos("Nudge (ms)", "Video Stream Tracking") / 1000.0
+        nudge_ticks = cv2.getTrackbarPos("Nudge Ticks", "Video Stream Tracking")
+        if state == "CENTERING":
+            max_dx = 320
+            active_thresh = fine_thresh if obj_area is not None and obj_area >= fine_tune_area else center_thresh
+            ratio = min(1.0, max(0.0, (abs_dx - active_thresh) / (max_dx - active_thresh)))
+            nudge_eff_ticks = max(1, int(nudge_ticks * (0.3 + 0.7 * ratio) + 0.5))
+        elif state in ("FINE_APPROACH", "BACKING"):
+            nudge_eff_ticks = max(1, int(nudge_ticks * 0.3 + 0.5))
+        else:
+            nudge_eff_ticks = nudge_ticks
 
+        # Nudge state machine (Arduino auto-stops after tick target)
         if nudge_state == "IDLE":
             if state in ("CENTERING", "APPROACHING", "FINE_APPROACH", "BACKING"):
-                threading.Thread(target=send_movement, args=(args.robot_ip, robot_cmd), daemon=True).start()
-                nudge_state = "NUDGING"
-                nudge_start = current_time
-                fine_or_back = state in ("FINE_APPROACH", "BACKING")
-                if state == "CENTERING":
-                    max_dx = 320
-                    ratio = min(1.0, max(0.0, (abs_dx - center_thresh) / (max_dx - center_thresh)))
-                    nudge_eff_dur = nudge_dur * (0.3 + 0.7 * ratio)
-                elif fine_or_back:
-                    nudge_eff_dur = nudge_dur * 0.3
-                else:
-                    nudge_eff_dur = nudge_dur
-        elif nudge_state == "NUDGING":
-            if current_time - nudge_start >= nudge_eff_dur:
-                threading.Thread(target=send_movement, args=(args.robot_ip, "stop"), daemon=True).start()
+                threading.Thread(target=send_movement, args=(args.robot_ip, robot_cmd, nudge_eff_ticks), daemon=True).start()
                 nudge_state = "COOLDOWN"
+                nudge_start = current_time
         elif nudge_state == "COOLDOWN":
-            if current_time - nudge_start >= nudge_eff_dur + cooldown:
+            if current_time - nudge_start >= cooldown:
                 nudge_state = "IDLE"
 
         # Safety stop — send stop every cooldown while no object in sight
         if state == "IDLE" and current_time - last_cmd_time > cooldown:
             threading.Thread(target=send_movement, args=(args.robot_ip, "stop"), daemon=True).start()
             last_cmd_time = current_time
+
+        # Arm sequence trigger — fires after 2s of continuous STOPPED
+        if state == "STOPPED":
+            if stoppped_since is None:
+                stoppped_since = current_time
+            elif not arm_sequence_triggered and current_time - stoppped_since >= 2.0:
+                arm_sequence_triggered = True
+                threading.Thread(target=execute_arm_sequence, args=(args.robot_ip,), daemon=True).start()
+        else:
+            arm_sequence_triggered = False
+            stoppped_since = None
 
         # HUD backdrop
         overlay = frame.copy()
@@ -190,7 +217,7 @@ def main():
         color = state_colors.get(state, (255, 255, 255))
         cv2.putText(frame, f"Cam: {args.camera_ip} | Bot: {args.robot_ip}", (10, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-        cv2.putText(frame, f"TargetX:{target_x}  Thresh:{center_thresh}  Nudge:{nudge_dur*1000:.0f}ms", (10, 40),
+        cv2.putText(frame, f"TargetX:{target_x}  CTh:{center_thresh}  FTh:{fine_thresh}  Ticks:{nudge_ticks}", (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
         cv2.putText(frame, f"Stop:{stop_area}  Fine:{fine_tune_area}  Over:{overshoot_area}", (10, 58),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)

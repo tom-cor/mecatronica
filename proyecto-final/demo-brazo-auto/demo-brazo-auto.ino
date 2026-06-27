@@ -18,6 +18,10 @@ const int ENCODER_HOMBRO_DT  = 33;
 const int ENCODER_CODO_CLK   = 25;
 const int ENCODER_CODO_DT    = 26;
 
+// --- Pines de Encoders Ópticos de Tracción ---
+const int ENCODER_IZQ = 16;
+const int ENCODER_DER = 17;
+
 // --- Asignación de Pines del L298N (Motores Amarillos) ---
 const int PIN_ENA = 22; 
 const int PIN_IN1 = 21; 
@@ -47,14 +51,18 @@ bool triggerSequence = false;
 bool triggerReverse = false;
 volatile bool stopRequested = false; 
 
+volatile int encCountL = 0;
+volatile int encCountR = 0;
+
+int targetTicks = 0;
+int startTicks = 0;
+String tickDir = "";
+
 String currentMovement = "stop"; 
 bool motorsEnabled = false;
-int motorSpeed = 100;        // Velocidad continua (Rango 0 - 255)
-int turnSpeed = 100;         // Velocidad al girar (Rango 0 - 255)
-int forwardKickPWM = 200;    // Fuerza arranque adelante (150-255)
-int forwardKickDur  = 15;    // Duración arranque adelante ms (0-100)
-int turnKickPWM     = 200;   // Fuerza arranque giro (150-255)
-int turnKickDur     = 15;    // Duración arranque giro ms (0-100)
+int motorSpeed = 180;        // Velocidad continua (Rango 0 - 255)
+int turnSpeed = 180;         // Velocidad al girar (Rango 0 - 255)
+int defaultTicks = 5;        // Ticks por defecto para botones manuales (1-50)
 
 const int NUM_POINTS = 3;
 int sequence[NUM_POINTS][2] = {
@@ -67,13 +75,10 @@ WebServer server(80);
 
 // --- Función de Control de Tracción L298N ---
 void updateMotorAction(String cmd) {
-  static String lastCmd = "stop";
-
   if (!motorsEnabled || cmd == "stop") {
     digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, LOW);
     digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
     ledcWrite(PIN_ENA, 0);      ledcWrite(PIN_ENB, 0);
-    lastCmd = "stop";
     return;
   }
 
@@ -91,22 +96,9 @@ void updateMotorAction(String cmd) {
     digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH);  // B reverse
   }
 
-  // Kickstart con parámetros separados por modo
   bool isTurn = (cmd == "left" || cmd == "right");
-  bool needsKick = (cmd != lastCmd && !isTurn && forwardKickDur > 0) || (cmd != lastCmd && isTurn && turnKickDur > 0);
-  if (needsKick) {
-    int pwm = isTurn ? turnKickPWM : forwardKickPWM;
-    int dur = isTurn ? turnKickDur : forwardKickDur;
-    ledcWrite(PIN_ENA, isTurn ? 0 : pwm);
-    ledcWrite(PIN_ENB, pwm);
-    delay(dur);
-  }
-
-  // PWM continuo: turn usa turnSpeed en B, forward/backward usa motorSpeed en ambos
   ledcWrite(PIN_ENA, isTurn ? 0 : motorSpeed);
   ledcWrite(PIN_ENB, isTurn ? turnSpeed : motorSpeed);
-
-  lastCmd = cmd;
 }
 
 // --- Interrupciones ---
@@ -129,6 +121,9 @@ void IRAM_ATTR alCambiarCodo() {
   }
   ultimoEstadoCLK_Codo = estadoCLK;
 }
+
+void IRAM_ATTR onEncoderLeft()  { encCountL++; }
+void IRAM_ATTR onEncoderRight() { encCountR++; }
 
 // --- Función de Espera Activa ---
 void smartDelay(unsigned long ms) {
@@ -241,30 +236,18 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
         </div>
         
         <div class="control-group">
-            <label>Velocidad Continua (PWM) <span id="valSpeed" class="value-display">150</span></label>
-            <input type="range" min="0" max="255" value="150" class="slider" id="motorSpeed" oninput="updateMotorConfig()">
+            <label>Velocidad Continua (PWM) <span id="valSpeed" class="value-display">180</span></label>
+            <input type="range" min="0" max="255" value="180" class="slider" id="motorSpeed" oninput="updateMotorConfig()">
         </div>
         
         <div class="control-group">
-            <label>Velocidad de Giro (Turn PWM) <span id="valTurn" class="value-display">100</span></label>
-            <input type="range" min="0" max="255" value="100" class="slider" id="turnSpeed" oninput="updateMotorConfig()">
+            <label>Velocidad de Giro (Turn PWM) <span id="valTurn" class="value-display">180</span></label>
+            <input type="range" min="0" max="255" value="180" class="slider" id="turnSpeed" oninput="updateMotorConfig()">
         </div>
 
         <div class="control-group">
-            <label>Fuerza Arranque Adelante <span id="valFwdKick" class="value-display">200</span></label>
-            <input type="range" min="150" max="255" value="200" class="slider" id="forwardKickPWM" oninput="updateMotorConfig()">
-        </div>
-        <div class="control-group">
-            <label>Duración Arranque Adelante (ms) <span id="valFwdDur" class="value-display">15</span></label>
-            <input type="range" min="0" max="100" value="15" class="slider" id="forwardKickDur" oninput="updateMotorConfig()">
-        </div>
-        <div class="control-group">
-            <label>Fuerza Arranque Giro <span id="valTurnKick" class="value-display">200</span></label>
-            <input type="range" min="150" max="255" value="200" class="slider" id="turnKickPWM" oninput="updateMotorConfig()">
-        </div>
-        <div class="control-group">
-            <label>Duración Arranque Giro (ms) <span id="valTurnDur" class="value-display">15</span></label>
-            <input type="range" min="0" max="100" value="15" class="slider" id="turnKickDur" oninput="updateMotorConfig()">
+            <label>Default Ticks <span id="valDefaultTicks" class="value-display">5</span></label>
+            <input type="range" min="1" max="50" value="5" class="slider" id="defaultTicks" oninput="updateMotorConfig()">
         </div>
 
         <label>Control de Pruebas Manuales:</label>
@@ -326,20 +309,14 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
             let isEnabled = document.getElementById('motorEnabled').checked ? 1 : 0;
             let currentSpeed = document.getElementById('motorSpeed').value;
             let currentTurn = document.getElementById('turnSpeed').value;
-            let curFwdPWM = document.getElementById('forwardKickPWM').value;
-            let curFwdDur = document.getElementById('forwardKickDur').value;
-            let curTurnPWM = document.getElementById('turnKickPWM').value;
-            let curTurnDur = document.getElementById('turnKickDur').value;
+            let curDefaultTicks = document.getElementById('defaultTicks').value;
             
             document.getElementById('valSpeed').innerText = currentSpeed;
             document.getElementById('valTurn').innerText = currentTurn;
-            document.getElementById('valFwdKick').innerText = curFwdPWM;
-            document.getElementById('valFwdDur').innerText = curFwdDur;
-            document.getElementById('valTurnKick').innerText = curTurnPWM;
-            document.getElementById('valTurnDur').innerText = curTurnDur;
+            document.getElementById('valDefaultTicks').innerText = curDefaultTicks;
             
             fetch('/motorConfig?enabled=' + isEnabled + '&speed=' + currentSpeed + '&turnPWM=' + currentTurn
-                + '&fwdPWM=' + curFwdPWM + '&fwdDur=' + curFwdDur + '&turnKickPWM=' + curTurnPWM + '&turnKickDur=' + curTurnDur);
+                + '&defaultTicks=' + curDefaultTicks);
         }
 
         function runSequence() { fetch('/sequence'); }
@@ -366,10 +343,7 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
                 
                 document.getElementById('motorSpeed').value = data.speed; document.getElementById('valSpeed').innerText = data.speed;
                 document.getElementById('turnSpeed').value = data.turn; document.getElementById('valTurn').innerText = data.turn;
-                document.getElementById('forwardKickPWM').value = data.fwdPWM; document.getElementById('valFwdKick').innerText = data.fwdPWM;
-                document.getElementById('forwardKickDur').value = data.fwdDur; document.getElementById('valFwdDur').innerText = data.fwdDur;
-                document.getElementById('turnKickPWM').value = data.turnKickPWM; document.getElementById('valTurnKick').innerText = data.turnKickPWM;
-                document.getElementById('turnKickDur').value = data.turnKickDur; document.getElementById('valTurnDur').innerText = data.turnKickDur;
+                document.getElementById('defaultTicks').value = data.defTicks; document.getElementById('valDefaultTicks').innerText = data.defTicks;
                 
                 document.getElementById('motorEnabled').checked = data.enabled;
             });
@@ -388,22 +362,18 @@ void handleStatus() {
   String json = "{\"A\":" + String(posA) + ",\"B\":" + String(posB) + ",\"C\":" + String(posC) + ",\"D\":" + String(posD) + 
                 ",\"mov\":\"" + currentMovement + "\",\"speed\":" + String(motorSpeed) + ",\"enabled\":" + (motorsEnabled ? "true" : "false") + 
                 ",\"turn\":" + String(turnSpeed) + 
-                ",\"fwdPWM\":" + String(forwardKickPWM) + ",\"fwdDur\":" + String(forwardKickDur) + 
-                ",\"turnKickPWM\":" + String(turnKickPWM) + ",\"turnKickDur\":" + String(turnKickDur) + "}";
+                ",\"defTicks\":" + String(defaultTicks) + 
+                ",\"encL\":" + String(encCountL) + ",\"encR\":" + String(encCountR) + "}";
   server.send(200, "application/json", json);
 }
 
 void handleMotorConfig() {
-  // Ahora requiere también el parámetro kickDur
   if (server.hasArg("enabled") && server.hasArg("speed") && server.hasArg("turnPWM")
-      && server.hasArg("fwdPWM") && server.hasArg("fwdDur") && server.hasArg("turnKickPWM") && server.hasArg("turnKickDur")) {
+      && server.hasArg("defaultTicks")) {
     motorsEnabled = server.arg("enabled") == "1";
     motorSpeed = constrain(server.arg("speed").toInt(), 0, 255);
     turnSpeed = constrain(server.arg("turnPWM").toInt(), 0, 255);
-    forwardKickPWM = constrain(server.arg("fwdPWM").toInt(), 150, 255);
-    forwardKickDur = constrain(server.arg("fwdDur").toInt(), 0, 100);
-    turnKickPWM = constrain(server.arg("turnKickPWM").toInt(), 150, 255);
-    turnKickDur = constrain(server.arg("turnKickDur").toInt(), 0, 100);
+    defaultTicks = constrain(server.arg("defaultTicks").toInt(), 1, 50);
     
     if (!motorsEnabled) updateMotorAction("stop");
     else updateMotorAction(currentMovement); 
@@ -474,10 +444,36 @@ void handleMoveRequest() {
       currentMovement.trim();
     }
     
-    Serial.println("Comando traccion recibido: " + currentMovement);
+    // Parse optional "ticks" field
+    int ticksIndex = body.indexOf("\"ticks\"");
+    if (ticksIndex != -1) {
+      int colonIndex = body.indexOf(':', ticksIndex);
+      int valStart = colonIndex + 1;
+      while (valStart < (int)body.length() && body[valStart] == ' ') valStart++;
+      int valEnd = valStart;
+      while (valEnd < (int)body.length() && isDigit(body[valEnd])) valEnd++;
+      if (valEnd > valStart) {
+        targetTicks = body.substring(valStart, valEnd).toInt();
+        tickDir = currentMovement;
+        if (currentMovement == "left" || currentMovement == "right") {
+          startTicks = encCountR;
+        } else {
+          startTicks = encCountL;
+        }
+      }
+    } else if (currentMovement != "stop") {
+      targetTicks = defaultTicks;
+      tickDir = currentMovement;
+      startTicks = (currentMovement == "left" || currentMovement == "right") ? encCountR : encCountL;
+    } else {
+      targetTicks = 0;
+    }
+    
+    Serial.println("Comando traccion recibido: " + currentMovement + " ticks:" + String(targetTicks));
 
     if (currentMovement.equalsIgnoreCase("stop")) {
       stopRequested = true;
+      targetTicks = 0;
       triggerSequence = false;
       triggerReverse = false;
     } else {
@@ -529,6 +525,11 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENCODER_HOMBRO_CLK), alCambiarHombro, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENCODER_CODO_CLK), alCambiarCodo, CHANGE);
 
+  pinMode(ENCODER_IZQ, INPUT_PULLUP);
+  pinMode(ENCODER_DER, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_IZQ), onEncoderLeft, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_DER), onEncoderRight, RISING);
+
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   Serial.printf("\nWiFi Conectado. IP: http://%s\n", WiFi.localIP().toString().c_str());
@@ -549,6 +550,15 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  // Check if tick-based nudge has finished
+  if (targetTicks > 0) {
+    int current = (tickDir == "left" || tickDir == "right") ? encCountR : encCountL;
+    if (abs(current - startTicks) >= targetTicks) {
+      updateMotorAction("stop");
+      targetTicks = 0;
+    }
+  }
 
   if (triggerSequence) {
     triggerSequence = false;
