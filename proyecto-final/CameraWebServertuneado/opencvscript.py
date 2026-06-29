@@ -24,6 +24,8 @@ def send_movement(ip, direction, ticks=None):
 def execute_arm_sequence(ip):
     """Executes reverse → close gripper → forward sequence after robot stops."""
     try:
+        requests.post(f"http://{ip}/move", json={"command": "stop"}, timeout=2)
+        time.sleep(0.3)
         requests.get(f"http://{ip}/reverse", timeout=10)
         time.sleep(1)
         requests.get(f"http://{ip}/gripper/close", timeout=5)

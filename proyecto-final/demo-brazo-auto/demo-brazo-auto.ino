@@ -63,6 +63,7 @@ bool motorsEnabled = false;
 int motorSpeed = 180;        // Velocidad continua (Rango 0 - 255)
 int turnSpeed = 180;         // Velocidad al girar (Rango 0 - 255)
 int defaultTicks = 5;        // Ticks por defecto para botones manuales (1-50)
+bool tankTurn = false;       // Tank turn (ambas ruedas) vs single-wheel
 
 const int NUM_POINTS = 3;
 int sequence[NUM_POINTS][2] = {
@@ -89,16 +90,30 @@ void updateMotorAction(String cmd) {
     digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, HIGH);
     digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH);
   } else if (cmd == "left") {
-    digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, LOW);   // A stop
-    digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);   // B forward
+    if (tankTurn) {
+      digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, HIGH); // A reverse
+      digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);  // B forward
+    } else {
+      digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, LOW);  // A stop
+      digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);  // B forward
+    }
   } else if (cmd == "right") {
-    digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, LOW);   // A stop
-    digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH);  // B reverse
+    if (tankTurn) {
+      digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);  // A forward
+      digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH); // B reverse
+    } else {
+      digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, LOW);  // A stop
+      digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH); // B reverse
+    }
   }
 
-  bool isTurn = (cmd == "left" || cmd == "right");
-  ledcWrite(PIN_ENA, isTurn ? 0 : motorSpeed);
-  ledcWrite(PIN_ENB, isTurn ? turnSpeed : motorSpeed);
+  if (cmd == "left" || cmd == "right") {
+    ledcWrite(PIN_ENA, tankTurn ? turnSpeed : 0);
+    ledcWrite(PIN_ENB, turnSpeed);
+  } else {
+    ledcWrite(PIN_ENA, motorSpeed);
+    ledcWrite(PIN_ENB, motorSpeed);
+  }
 }
 
 // --- Interrupciones ---
@@ -250,6 +265,11 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
             <input type="range" min="1" max="50" value="5" class="slider" id="defaultTicks" oninput="updateMotorConfig()">
         </div>
 
+        <div class="toggle-group">
+            <input type="checkbox" id="tankTurn" onchange="updateMotorConfig()">
+            <label for="tankTurn" style="margin:0; font-size: 16px; color: #2c3e50; cursor: pointer;">Tank Turn (ambas ruedas)</label>
+        </div>
+
         <label>Control de Pruebas Manuales:</label>
         <div class="d-pad">
             <div class="empty-cell"></div>
@@ -310,13 +330,14 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
             let currentSpeed = document.getElementById('motorSpeed').value;
             let currentTurn = document.getElementById('turnSpeed').value;
             let curDefaultTicks = document.getElementById('defaultTicks').value;
+            let curTankTurn = document.getElementById('tankTurn').checked ? 1 : 0;
             
             document.getElementById('valSpeed').innerText = currentSpeed;
             document.getElementById('valTurn').innerText = currentTurn;
             document.getElementById('valDefaultTicks').innerText = curDefaultTicks;
             
             fetch('/motorConfig?enabled=' + isEnabled + '&speed=' + currentSpeed + '&turnPWM=' + currentTurn
-                + '&defaultTicks=' + curDefaultTicks);
+                + '&defaultTicks=' + curDefaultTicks + '&tankTurn=' + curTankTurn);
         }
 
         function runSequence() { fetch('/sequence'); }
@@ -346,6 +367,7 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
                 document.getElementById('defaultTicks').value = data.defTicks; document.getElementById('valDefaultTicks').innerText = data.defTicks;
                 
                 document.getElementById('motorEnabled').checked = data.enabled;
+                document.getElementById('tankTurn').checked = data.tank;
             });
         }, 500); 
     </script>
@@ -363,17 +385,19 @@ void handleStatus() {
                 ",\"mov\":\"" + currentMovement + "\",\"speed\":" + String(motorSpeed) + ",\"enabled\":" + (motorsEnabled ? "true" : "false") + 
                 ",\"turn\":" + String(turnSpeed) + 
                 ",\"defTicks\":" + String(defaultTicks) + 
+                ",\"tank\":" + (tankTurn ? "true" : "false") + 
                 ",\"encL\":" + String(encCountL) + ",\"encR\":" + String(encCountR) + "}";
   server.send(200, "application/json", json);
 }
 
 void handleMotorConfig() {
   if (server.hasArg("enabled") && server.hasArg("speed") && server.hasArg("turnPWM")
-      && server.hasArg("defaultTicks")) {
+      && server.hasArg("defaultTicks") && server.hasArg("tankTurn")) {
     motorsEnabled = server.arg("enabled") == "1";
     motorSpeed = constrain(server.arg("speed").toInt(), 0, 255);
     turnSpeed = constrain(server.arg("turnPWM").toInt(), 0, 255);
     defaultTicks = constrain(server.arg("defaultTicks").toInt(), 1, 50);
+    tankTurn = server.arg("tankTurn") == "1";
     
     if (!motorsEnabled) updateMotorAction("stop");
     else updateMotorAction(currentMovement); 
