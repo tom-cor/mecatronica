@@ -21,7 +21,7 @@ def send_movement(ip, direction, ticks=None):
     except requests.exceptions.RequestException:
         pass
 
-def execute_arm_sequence(ip, arm_in_progress):
+def execute_yellow_arm_sequence(ip, arm_in_progress):
     """Opens gripper → reverse → close → 2s → forward → 2s after robot stops."""
     arm_in_progress.set()
     try:
@@ -32,6 +32,23 @@ def execute_arm_sequence(ip, arm_in_progress):
         requests.get(f"http://{ip}/reverse", timeout=10)
         time.sleep(5)
         requests.get(f"http://{ip}/gripper/close", timeout=5)
+        time.sleep(2)
+        requests.get(f"http://{ip}/sequence", timeout=10)
+        time.sleep(5)
+    except requests.exceptions.RequestException:
+        pass
+    finally:
+        arm_in_progress.clear()
+
+def execute_blue_arm_sequence(ip, arm_in_progress):
+    """Reverse (gripper closed) → open gripper → forward after blue stop."""
+    arm_in_progress.set()
+    try:
+        requests.post(f"http://{ip}/move", json={"command": "stop"}, timeout=2)
+        time.sleep(1)
+        requests.get(f"http://{ip}/reverse", timeout=10)
+        time.sleep(5)
+        requests.get(f"http://{ip}/gripper/open", timeout=5)
         time.sleep(2)
         requests.get(f"http://{ip}/sequence", timeout=10)
         time.sleep(5)
@@ -64,6 +81,8 @@ def main():
     cv2.createTrackbar("Stop Area", "Video Stream Tracking", 15500, 30000, nothing)
     cv2.createTrackbar("Fine Area", "Video Stream Tracking", 10000, 30000, nothing)
     cv2.createTrackbar("Over Area", "Video Stream Tracking", 17000, 30000, nothing)
+    cv2.createTrackbar("Blue Target Y", "Video Stream Tracking", 350, 480, nothing)
+    cv2.createTrackbar("Blue Y Thresh", "Video Stream Tracking", 30, 100, nothing)
 
     print("--- Tracking Started ---")
     print(f"Sending movement commands to http://{args.robot_ip}/move/")
@@ -86,6 +105,7 @@ def main():
     arm_sequence_triggered = False
     stopped_since = None
     arm_in_progress = threading.Event()
+    tracking_mode = "YELLOW"
 
     while True:
         ret, frame = cap.read()
@@ -119,53 +139,82 @@ def main():
         contours_blue, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_yellow, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        for cnt in contours_blue:
-            if cv2.contourArea(cnt) > 500:
-                x, y, w, h = cv2.boundingRect(cnt)
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                cv2.putText(frame, "Blue", (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-
-        # --- Two-phase approach state machine ---
+        # --- Dual-mode state machine ---
         robot_cmd = None
         state = "IDLE"
         obj_area = None
 
-        if contours_yellow:
-            largest_yellow = max(contours_yellow, key=cv2.contourArea)
-            obj_area = cv2.contourArea(largest_yellow)
+        if tracking_mode == "YELLOW":
+            if contours_yellow:
+                largest_yellow = max(contours_yellow, key=cv2.contourArea)
+                obj_area = cv2.contourArea(largest_yellow)
 
-            if obj_area > 500:
-                x, y, w, h = cv2.boundingRect(largest_yellow)
+                if obj_area > 500:
+                    x, y, w, h = cv2.boundingRect(largest_yellow)
 
-                obj_cx = x + w // 2
-                obj_cy = y + h // 2
+                    obj_cx = x + w // 2
+                    obj_cy = y + h // 2
 
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
-                cv2.circle(frame, (obj_cx, obj_cy), 5, (0, 255, 255), -1)
-                cv2.line(frame, (target_x, obj_cy), (obj_cx, obj_cy), (0, 255, 255), 1)
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                    cv2.circle(frame, (obj_cx, obj_cy), 5, (0, 255, 255), -1)
+                    cv2.line(frame, (target_x, obj_cy), (obj_cx, obj_cy), (0, 255, 255), 1)
 
-                dx = obj_cx - target_x
-                abs_dx = abs(dx)
+                    dx = obj_cx - target_x
+                    abs_dx = abs(dx)
 
-                if obj_area >= overshoot_area:
-                    state = "BACKING"
-                    robot_cmd = "backward"
-                elif obj_area >= stop_area:
-                    if abs_dx <= fine_thresh:
-                        state = "STOPPED"
-                        robot_cmd = "stop"
-                    else:
+                    if obj_area >= overshoot_area:
+                        state = "BACKING"
+                        robot_cmd = "backward"
+                    elif obj_area >= stop_area:
+                        if abs_dx <= fine_thresh:
+                            state = "STOPPED"
+                            robot_cmd = "stop"
+                        else:
+                            state = "CENTERING"
+                            robot_cmd = "right" if dx > 0 else "left"
+                    elif abs_dx > (fine_thresh if obj_area >= fine_tune_area else center_thresh):
                         state = "CENTERING"
                         robot_cmd = "right" if dx > 0 else "left"
-                elif abs_dx > (fine_thresh if obj_area >= fine_tune_area else center_thresh):
-                    state = "CENTERING"
-                    robot_cmd = "right" if dx > 0 else "left"
-                elif obj_area >= fine_tune_area:
-                    state = "FINE_APPROACH"
-                    robot_cmd = "forward"
-                else:
-                    state = "APPROACHING"
-                    robot_cmd = "forward"
+                    elif obj_area >= fine_tune_area:
+                        state = "FINE_APPROACH"
+                        robot_cmd = "forward"
+                    else:
+                        state = "APPROACHING"
+                        robot_cmd = "forward"
+        elif tracking_mode == "BLUE":
+            blue_target_y = cv2.getTrackbarPos("Blue Target Y", "Video Stream Tracking")
+            blue_y_thresh = cv2.getTrackbarPos("Blue Y Thresh", "Video Stream Tracking")
+
+            if contours_blue:
+                largest_blue = max(contours_blue, key=cv2.contourArea)
+                obj_area = cv2.contourArea(largest_blue)
+
+                if obj_area > 500:
+                    x, y, w, h = cv2.boundingRect(largest_blue)
+                    obj_cx = x + w // 2
+                    obj_cy = y + h // 2
+
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                    cv2.circle(frame, (obj_cx, obj_cy), 5, (255, 0, 0), -1)
+                    cv2.line(frame, (target_x, obj_cy), (obj_cx, obj_cy), (0, 255, 255), 1)
+
+                    dx = obj_cx - target_x
+                    abs_dx = abs(dx)
+                    dy = obj_cy - blue_target_y
+                    abs_dy = abs(dy)
+
+                    if abs_dx <= fine_thresh and abs_dy <= blue_y_thresh:
+                        state = "STOPPED"
+                        robot_cmd = "stop"
+                    elif abs_dx > fine_thresh:
+                        state = "CENTERING"
+                        robot_cmd = "right" if dx > 0 else "left"
+                    elif dy > blue_y_thresh:
+                        state = "APPROACHING"
+                        robot_cmd = "forward"
+                    elif dy < -blue_y_thresh:
+                        state = "BACKING"
+                        robot_cmd = "backward"
 
         # Fallback to stop when no object
         if robot_cmd is None:
@@ -199,10 +248,19 @@ def main():
                 arm_sequence_triggered = True
                 arm_in_progress.set()
                 send_movement(args.robot_ip, "stop")
-                threading.Thread(target=execute_arm_sequence, args=(args.robot_ip, arm_in_progress), daemon=True).start()
-        elif not arm_in_progress.is_set():
+                if tracking_mode == "YELLOW":
+                    threading.Thread(target=execute_yellow_arm_sequence, args=(args.robot_ip, arm_in_progress), daemon=True).start()
+                else:
+                    threading.Thread(target=execute_blue_arm_sequence, args=(args.robot_ip, arm_in_progress), daemon=True).start()
+
+        # Detect arm completion → switch to BLUE
+        if arm_sequence_triggered and not arm_in_progress.is_set():
             arm_sequence_triggered = False
             stopped_since = None
+            if tracking_mode == "YELLOW":
+                tracking_mode = "BLUE"
+                nudge_state = "IDLE"
+                print("--- Switched to BLUE tracking ---")
 
         # HUD backdrop
         overlay = frame.copy()
@@ -219,12 +277,19 @@ def main():
             "IDLE": (128, 128, 128),
         }
         color = state_colors.get(state, (255, 255, 255))
-        cv2.putText(frame, f"Cam: {args.camera_ip} | Bot: {args.robot_ip}", (10, 22),
+        cv2.putText(frame, f"Cam: {args.camera_ip} | Bot: {args.robot_ip} | Mode: {tracking_mode}", (10, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-        cv2.putText(frame, f"TargetX:{target_x}  CTh:{center_thresh}  FTh:{fine_thresh}  Ticks:{nudge_ticks}", (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-        cv2.putText(frame, f"Stop:{stop_area}  Fine:{fine_tune_area}  Over:{overshoot_area}", (10, 58),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        if tracking_mode == "YELLOW":
+            cv2.putText(frame, f"TargetX:{target_x}  CTh:{center_thresh}  FTh:{fine_thresh}  Ticks:{nudge_ticks}", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            cv2.putText(frame, f"Stop:{stop_area}  Fine:{fine_tune_area}  Over:{overshoot_area}", (10, 58),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        else:
+            blue_target_y = cv2.getTrackbarPos("Blue Target Y", "Video Stream Tracking")
+            cv2.putText(frame, f"TargetX:{target_x}  CTh:{center_thresh}  FTh:{fine_thresh}  Ticks:{nudge_ticks}", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            cv2.putText(frame, f"BlueY:{blue_target_y}  YTh:{cv2.getTrackbarPos('Blue Y Thresh', 'Video Stream Tracking')}", (10, 58),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
         if obj_area is not None:
             cv2.putText(frame, f"[{state}]  Area:{int(obj_area)}  Sending:{robot_cmd.upper()}", (10, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
