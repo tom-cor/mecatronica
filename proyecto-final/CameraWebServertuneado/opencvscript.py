@@ -21,18 +21,24 @@ def send_movement(ip, direction, ticks=None):
     except requests.exceptions.RequestException:
         pass
 
-def execute_arm_sequence(ip):
-    """Executes reverse → close gripper → forward sequence after robot stops."""
+def execute_arm_sequence(ip, arm_in_progress):
+    """Opens gripper → reverse → close → 2s → forward → 2s after robot stops."""
+    arm_in_progress.set()
     try:
         requests.post(f"http://{ip}/move", json={"command": "stop"}, timeout=2)
-        time.sleep(0.3)
+        time.sleep(1)
+        requests.get(f"http://{ip}/gripper/open", timeout=5)
+        time.sleep(2)
         requests.get(f"http://{ip}/reverse", timeout=10)
-        time.sleep(1)
+        time.sleep(5)
         requests.get(f"http://{ip}/gripper/close", timeout=5)
-        time.sleep(1)
+        time.sleep(2)
         requests.get(f"http://{ip}/sequence", timeout=10)
+        time.sleep(5)
     except requests.exceptions.RequestException:
         pass
+    finally:
+        arm_in_progress.clear()
 
 def main():
     parser = argparse.ArgumentParser(description="Track objects and send movement commands.")
@@ -75,9 +81,11 @@ def main():
     cooldown = 0.5 
     nudge_state = "IDLE"
     nudge_start = 0
-    nudge_eff_ticks = 0
+
     abs_dx = 0
     arm_sequence_triggered = False
+    stopped_since = None
+    arm_in_progress = threading.Event()
 
     while True:
         ret, frame = cap.read()
@@ -163,23 +171,14 @@ def main():
         if robot_cmd is None:
             robot_cmd = "stop"
 
-        # Compute effective ticks for the next nudge
         current_time = time.time()
         nudge_ticks = cv2.getTrackbarPos("Nudge Ticks", "Video Stream Tracking")
-        if state == "CENTERING":
-            max_dx = 320
-            active_thresh = fine_thresh if obj_area is not None and obj_area >= fine_tune_area else center_thresh
-            ratio = min(1.0, max(0.0, (abs_dx - active_thresh) / (max_dx - active_thresh)))
-            nudge_eff_ticks = max(1, int(nudge_ticks * (0.3 + 0.7 * ratio) + 0.5))
-        elif state in ("FINE_APPROACH", "BACKING"):
-            nudge_eff_ticks = max(1, int(nudge_ticks * 0.3 + 0.5))
-        else:
-            nudge_eff_ticks = nudge_ticks
 
         # Nudge state machine (Arduino auto-stops after tick target)
         if nudge_state == "IDLE":
             if state in ("CENTERING", "APPROACHING", "FINE_APPROACH", "BACKING"):
-                threading.Thread(target=send_movement, args=(args.robot_ip, robot_cmd, nudge_eff_ticks), daemon=True).start()
+                if not arm_in_progress.is_set():
+                    threading.Thread(target=send_movement, args=(args.robot_ip, robot_cmd, nudge_ticks), daemon=True).start()
                 nudge_state = "COOLDOWN"
                 nudge_start = current_time
         elif nudge_state == "COOLDOWN":
@@ -188,19 +187,22 @@ def main():
 
         # Safety stop — send stop every cooldown while no object in sight
         if state == "IDLE" and current_time - last_cmd_time > cooldown:
-            threading.Thread(target=send_movement, args=(args.robot_ip, "stop"), daemon=True).start()
+            if not arm_in_progress.is_set():
+                threading.Thread(target=send_movement, args=(args.robot_ip, "stop"), daemon=True).start()
             last_cmd_time = current_time
 
         # Arm sequence trigger — fires after 2s of continuous STOPPED
         if state == "STOPPED":
-            if stoppped_since is None:
-                stoppped_since = current_time
-            elif not arm_sequence_triggered and current_time - stoppped_since >= 2.0:
+            if stopped_since is None:
+                stopped_since = current_time
+            elif not arm_sequence_triggered and not arm_in_progress.is_set() and current_time - stopped_since >= 2.0:
                 arm_sequence_triggered = True
-                threading.Thread(target=execute_arm_sequence, args=(args.robot_ip,), daemon=True).start()
-        else:
+                arm_in_progress.set()
+                send_movement(args.robot_ip, "stop")
+                threading.Thread(target=execute_arm_sequence, args=(args.robot_ip, arm_in_progress), daemon=True).start()
+        elif not arm_in_progress.is_set():
             arm_sequence_triggered = False
-            stoppped_since = None
+            stopped_since = None
 
         # HUD backdrop
         overlay = frame.copy()
